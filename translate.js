@@ -1,14 +1,14 @@
 const fs = require('fs/promises');
 
-const OpenAI = require('openai');
+const { OpenAI }  = require("llamaindex");
+
+const llm = new OpenAI({ model: "gpt-3.5-turbo-1106", temperature: 0,  apiKey: process.env["OPENAI_API_KEY"], maxRetries: 5});
+
 
 const {Octokit} = require("@octokit/core");
 
 const {encode} = require("gpt-tokenizer");
 
-const openai = new OpenAI({
-  apiKey: process.env["OPENAI_API_KEY"]
-});
 
 const octokit = new Octokit({
     auth: process.env["GITHUB_PERSONAL_ACCESS_TOKEN"]
@@ -30,7 +30,7 @@ async function getLastFileVersion(owner, repoName, path) {
             const files = await getLastFileVersion(owner, repoName, file.path);
             docFiles = docFiles.concat(files);
         }
-        if (file.type === 'file' && file.name.endsWith('.md')) {
+        if (file.type === 'file' && (file.name.endsWith('.md') || file.name.endsWith('.mdx'))) {
             docFiles.push(file);
         }
     }
@@ -78,12 +78,13 @@ async function loadFiles(owner, repoName, files) {
       
     }
 }
- 
+
 // a function that takes a md file as a string and return a document hierarchical object
 function parseMdStrToTree(file) {
     const lines = file.split('\n');
     const doc = [];
-    let section = null;
+    let section = { title: '', level: 0, content: '' };
+    doc.push(section);
     for (let line of lines) {
         const match = line.match(/^(#{1,6}) /);
         if (match) {
@@ -95,7 +96,7 @@ function parseMdStrToTree(file) {
                 content: ''
             };
             doc.push(section);
-        } else if (section) {
+        } else {
             section.content += line + '\n';
         }
     }
@@ -107,7 +108,9 @@ function parseTreeToMdStr(doc, code='') {
     let str = '';
     for (let block of doc) {
         if (code) {
-            str += '#'.repeat(block.level) + ' ' + block[`title_${code}`][0] + '\n';
+            if (block.level > 0) { 
+                str += '#'.repeat(block.level) + ' ' + block[`title_${code}`][0] + '\n';
+            }
             str += block[`content_${code}`][0] + '\n';
         }
         else {
@@ -124,33 +127,49 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function translateTextTree(textTree, language, temp=0) {
+async function translateTextTree(textTree, language) {
          
     let text = parseTreeToMdStr(textTree);
     let messages = [];
+
+
     try {
+
          messages = [
             {
                 "role": "system",
-                "content": `Your are task with translating a technical documentation in ${language}. The user will provide the documentation in a markdown format. Translate it to ${language}. Only output the translated documentation in Markdown, do not add or remove content. Do not try to translate function/api endpoint name, only translate the documentation. If the documentation contain codeblocks, only translate commentaries, do not translate variablenames / function names. Try to output it in a {language} that is easy to read, do not try to translate all expressions verbatim, make it so it feel professional. If {language} usually use the enlish word for a thing, keep it in English. Notes: it's a computer doc, build mean 'compile', watch mean 'looking at file that change', ... Keep the same structure as the original documentation, and retain ALL the links / images.`,
+                "content": `
+You are a expert technical writer. Your goal is to translate a technical documentation in ${language}. The user will provide the documentation in a markdown format. Translate it to ${language}. 
+
+Guidelines:
+- Only output the translated documentation in Markdown, do not add or remove content. 
+- Do not try to translate function/api endpoint name, only translate the documentation. 
+- If the documentation contain codeblocks, only translate commentaries, do not translate variable names / function names.
+- Try to output it in ${language} that is easy to read, do not try to translate all expressions verbatim, make it so it feel professional. 
+- If ${language} usually use the english word for a thing, keep it in English.
+- Module names should be kept in English, add best effort translation. Always keep the original name in parenthesis, e.g. "聊天引擎 (ChatEngine)"
+
+Additional Notes:
+- it's a computer doc, build mean 'compile', watch mean 'looking at file that change',
+- Keep the same structure as the original documentation, and retain ALL the links / images.,
+`,
             },
             {
                 "role": "user",
-                "content": `The markdown to translate (remeber do not add extra content or remove content, just translate verbatim).\n Do not expend on content, only translate the documentation. The proposed text to translate may only contain a title, in this case only translate the titel. Original in English:\n\n ${text} "\n\nTranslation in ${language}:\n\n`
+                "content": `The markdown to translate (remember do not add extra content or remove content, just translate verbatim).\n Do not expend on content, only translate the documentation. The proposed text to translate may only contain a title, in this case only translate the title. Original in English:\n\n ${text} "\n\nTranslation in ${language}:\n\n`
             }
         ];
-        const chatCompletion = await openai.chat.completions.create({
-            messages: messages,
-            model: 'gpt-3.5-turbo-1106',
-            temperature: temp
-        });
-
-       // console.log(chatCompletion.choices[0].message.content)
 
 
-        let translationTree = parseMdStrToTree(chatCompletion.choices[0].message.content);
-       
-        let linkmatchesTranslated = chatCompletion.choices[0].message.content.match(/\[.*\]\(.*\)/g);
+        const chatCompletion = await llm.chat(messages);
+
+
+        // console.log(chatCompletion.choices[0].message.content)
+
+
+        let translationTree = parseMdStrToTree(chatCompletion.message.content);
+        
+        let linkmatchesTranslated =chatCompletion.message.content.match(/\[.*\]\(.*\)/g);
 
         let matchesNonTranslated = text.match(/\[.*\]\(.*\)/g);
 
@@ -159,19 +178,19 @@ async function translateTextTree(textTree, language, temp=0) {
             linkmatchesTranslated != matchesNonTranslated 
             &&translationTree.length != textTree.length 
             && messages.length < 10) {
-           messages.push({
-            "role": "assistant",
-            "content" : chatCompletion.choices[0].message.content
-           });
+            messages.push({
+                "role": "assistant",
+                "content" : chatCompletion.message.content
+            });
 
-           // TODO: add more checks here
-           if (translationTree.length > textTree.length) {
+            // TODO: add more checks here
+            if (translationTree.length > textTree.length) {
                 messages.push({
                     "role": "user",
                     "content" : "The translation is seems too long, did you add too much content? redo it correctly. Only output the translation, no other contexts"
-               });
-           }
-           else if (translationTree.length < textTree.length) {
+                });
+            }
+            else if (translationTree.length < textTree.length) {
                 messages.push({
                     "role": "user",
                     "content" : "The translation is seems too short, did you forget some content? redo it correctly. Only output the translation, no other contexts"
@@ -190,21 +209,13 @@ async function translateTextTree(textTree, language, temp=0) {
                 });
             }
 
-            console.log("=======\nRejectd", JSON.stringify(messages, null, 2));
-
-
-            chatCompletion = await openai.chat.completions.create({
-                messages: messages,
-                model: 'gpt-3.5-turbo-1106',
-                temperature: temp
-            });
-            translationTree = parseMdStrToTree(chatCompletion.choices[0].message.content);
-            linkmatchesTranslated = chatCompletion.choices[0].message.content.match(/\[.*\]\(.*\)/g);   
-            
-            console.log(chatCompletion.choices[0].message.content)
+            chatCompletion = await llm.chat(messages);
+            translationTree = parseMdStrToTree(chatCompletion.message.content);
+            linkmatchesTranslated = chatCompletion.message.content.match(/\[.*\]\(.*\)/g);   
+        
+        //console.log(chatCompletion.message.content)
         }
 
-        
 
         return translationTree;
     }
@@ -213,7 +224,7 @@ async function translateTextTree(textTree, language, temp=0) {
         console.log('sleeping');
         console.log("=======\eerror on ", JSON.stringify(messages, null, 2));
         await sleep(30000)
-        return translateTextTree(textTree, language, temp);
+        return translateTextTree(textTree, language);
     }
     
 }
@@ -241,7 +252,7 @@ async function translateFile(file, language, code) {
             }
         }
 
-        let translationTree = await translateTextTree(blocks, language, 0);
+        let translationTree = await translateTextTree(blocks, language);
         
         if (translationTree.length != blocks.length) { 
             if (!file.translationError) {
@@ -341,8 +352,9 @@ async function correctLinkInFile(file, languageCode, docDir) {
 
 }
 
-async function buildOutputMd(files, languageCode, rootTargetDir) { 
-    let targetDir = `${rootTargetDir}/${languageCode}`;
+async function buildOutputMd(files, languageCode, targetDir, prefixToRemove) { 
+
+    console.log('Prefix to remove', prefixToRemove)
     
     for (let file of files) {
         // check if file is translated in target language
@@ -353,7 +365,8 @@ async function buildOutputMd(files, languageCode, rootTargetDir) {
         await correctLinkInFile(file, languageCode);
 
         let translatedMd = parseTreeToMdStr(file.doc, languageCode);  
-        let path = `${targetDir}/${file.path}`;
+        let filePath = file.path.replace(prefixToRemove, '');
+        let path = `${targetDir}/${filePath}`;
 
         // check if every directory in path exists and create if not
         let dirs = path.split('/');
@@ -366,6 +379,7 @@ async function buildOutputMd(files, languageCode, rootTargetDir) {
                 await fs.mkdir(dir);
             }
         }
+        console.log(path); 
         await fs.writeFile(path, translatedMd, 'utf8');
     }
 }
@@ -380,7 +394,7 @@ async function printFiles(files, owner, repoName, repoDocDir) {
         let dir = '';
         for (let i = 0; i < dirs.length - 1; i++) {
             dir += dirs[i] + '/';
-            try {xw
+            try {
                 await fs.access(dir);
             } catch (error) {
                 await fs.mkdir(dir);
@@ -413,6 +427,7 @@ async function translateDoc(owner, repoName, repoDocDir, language, code, savePat
     }
     
     if (loadFile) {
+        console.log("Loading files from Github");
         await listDocFiles(files, owner, repoName, repoDocDir);
         await loadFiles(owner, repoName, files);
     }
@@ -420,14 +435,16 @@ async function translateDoc(owner, repoName, repoDocDir, language, code, savePat
     await translateFiles(files, language, code, savepath);
 }
 
-async function buildDoc(owner, repoName, code, savePath, outputPath) {
+async function buildDoc(owner, repoName, code, savePath, outputPath, prefixToRemove) {
     
     // const files = await listDocFiles(owner, repoName, repoDocDir);
     let files = [];
     let savepath  = `${savePath}/${owner}/${repoName}.json`;
     try {
         await fs.access(savepath);
-        files = require(savepath)
+        files = require(savepath);
+        // TODO handle legacy save file
+
     } catch {
         throw new Error('No save file found, please run translate first');
     }
@@ -450,13 +467,18 @@ async function buildDoc(owner, repoName, code, savePath, outputPath) {
         }
     }
     
-    await buildOutputMd(files, code, outPath);
+    await buildOutputMd(files, code, outPath, prefixToRemove);
 }
 
 
 // translateDoc('nodejs', 'node', 'doc', 'French', 'fr');
 //translateDoc('run-llama', 'llama_index', 'docs', 'French', 'fr')
+
+// translateDoc('run-llama', 'LlamaIndexTS', 'apps/docs/docs', 'Simplified Chinese(zh-Hans)', 'zh-Hans', './save')
+
 // translateDoc('run-llama', 'llama_index', 'docs', 'Simplified Chinese(zh_cn)', 'zh_cn')
+// translateDoc('run-llama', 'llama_index', 'docs', 'Italian', 'it', './save')
+
 
 module.exports = 
 {
